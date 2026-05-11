@@ -1,13 +1,9 @@
 """
-Gemini enrichment pipeline.
+OpenRouter enrichment pipeline.
 
-Reads raw Parquet from S3, calls gemini-1.5-flash in batches of 30
-with native JSON mode, joins enrichment back to the Spark DataFrame,
+Reads raw Parquet from S3, calls google/gemma-4-26b-a4b-it:free via OpenRouter
+in batches of 30, joins enrichment back via pandas merge,
 and writes enriched Parquet to S3 enriched/tracks/.
-
-Rate limit: Gemini free tier = 15 RPM. Pipeline sleeps 5s between
-batches (30 tracks/call) → ~4 RPM, well within limit.
-At 438 batches for 13K tracks, expect ~37 min total runtime.
 """
 import json
 import os
@@ -16,37 +12,28 @@ import time
 from pathlib import Path
 
 import boto3
-from google import genai
-from google.genai import types
+from openai import OpenAI
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 from dotenv import load_dotenv
-from pyspark.sql import SparkSession
-from pyspark.sql import functions as F
-from pyspark.sql.types import ArrayType, LongType, StringType, StructField, StructType
 from tqdm import tqdm
 
 load_dotenv(override=True)
 
 S3_BUCKET = os.environ["S3_BUCKET_NAME"]
 AWS_PROFILE = os.environ.get("AWS_PROFILE", "default")
-GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
+OPENROUTER_API_KEY = os.environ["OPENROUTER_API_KEY"]
 RAW_PREFIX = "raw/tracks"
 ENRICHED_PREFIX = "enriched/tracks"
 
 BATCH_SIZE = 30
-SLEEP_BETWEEN_BATCHES = 5  # seconds — keeps us ~4 RPM vs 15 RPM limit
-MAX_RETRIES = 5
+SLEEP_BETWEEN_BATCHES = 12  # seconds; free-tier Meta/Together ~10 RPM = 6s min, 12s gives headroom
+MAX_RETRIES = 7
+BACKOFF_BASE = 15.0  # seconds; start longer for free-tier rate limits
+BACKOFF_CAP = 120.0
+MODEL = "openai/gpt-oss-120b:free"
 
-ENRICHMENT_SCHEMA = StructType([
-    StructField("track_id", LongType(), False),
-    StructField("mood_tags", ArrayType(StringType()), True),
-    StructField("theme_tags", ArrayType(StringType()), True),
-    StructField("energy_level", StringType(), True),
-    StructField("danceability_guess", StringType(), True),
-    StructField("content_summary", StringType(), True),
-])
 
 PROMPT_TEMPLATE = """You are a music metadata enrichment system.
 
@@ -87,27 +74,30 @@ def upload_parquet_to_s3(local_dir: Path, bucket: str, prefix: str, profile: str
         s3.upload_file(str(f), bucket, f"{prefix}/{f.name}")
 
 
-def call_gemini_with_backoff(client: genai.Client, prompt: str, retries: int = MAX_RETRIES) -> list[dict]:
-    delay = 2.0
+def call_openrouter_with_backoff(client: OpenAI, prompt: str, retries: int = MAX_RETRIES) -> list[dict]:
     for attempt in range(retries):
         try:
-            response = client.models.generate_content(
-                model="gemini-1.5-flash",
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                ),
+            response = client.chat.completions.create(
+                model=MODEL,
+                messages=[{"role": "user", "content": prompt}],
             )
-            return json.loads(response.text)
+            if not response.choices or response.choices[0].message.content is None:
+                raise ValueError("Empty/null response from model (free-tier overload)")
+            text = response.choices[0].message.content
+            text = text.strip()
+            if text.startswith("```"):
+                text = text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+            return json.loads(text)
         except Exception as e:
-            err = str(e).lower()
-            if "429" in err or "quota" in err or "rate" in err:
-                wait = delay * (2 ** attempt)
-                print(f"  Rate limited. Sleeping {wait:.1f}s (attempt {attempt+1}/{retries})")
+            err = str(e)
+            err_lower = err.lower()
+            if "429" in err or "quota" in err_lower or "rate" in err_lower or "empty/null" in err_lower:
+                wait = min(BACKOFF_BASE * (2 ** attempt), BACKOFF_CAP)
+                print(f"  Rate limited / empty response. Sleeping {wait:.0f}s (attempt {attempt+1}/{retries})")
                 time.sleep(wait)
             else:
                 raise
-    raise RuntimeError(f"Gemini call failed after {retries} retries")
+    raise RuntimeError(f"OpenRouter call failed after {retries} retries")
 
 
 def build_prompt(batch: list[dict]) -> str:
@@ -126,9 +116,9 @@ def build_prompt(batch: list[dict]) -> str:
     return PROMPT_TEMPLATE.format(tracks_json=tracks_json)
 
 
-def enrich_batch(client: genai.Client, batch: list[dict]) -> list[dict]:
+def enrich_batch(client: OpenAI, batch: list[dict]) -> list[dict]:
     prompt = build_prompt(batch)
-    results = call_gemini_with_backoff(client, prompt)
+    results = call_openrouter_with_backoff(client, prompt)
 
     # Defensive: handle length mismatch from model
     enriched = []
@@ -151,16 +141,11 @@ def enrich_batch(client: genai.Client, batch: list[dict]) -> list[dict]:
 
 
 def run() -> None:
-    client = genai.Client(api_key=GEMINI_API_KEY)
-
-    spark = (
-        SparkSession.builder
-        .appName("soundscape-enrich-tracks")
-        .master("local[2]")
-        .config("spark.sql.shuffle.partitions", "4")
-        .getOrCreate()
+    client = OpenAI(
+        api_key=OPENROUTER_API_KEY,
+        base_url="https://openrouter.ai/api/v1",
+        max_retries=0,  # we handle retries ourselves
     )
-    spark.sparkContext.setLogLevel("WARN")
 
     with tempfile.TemporaryDirectory() as tmp:
         raw_dir = Path(tmp) / "raw"
@@ -169,16 +154,13 @@ def run() -> None:
         # --- 1. Download raw Parquet from S3 ---
         download_s3_prefix(S3_BUCKET, RAW_PREFIX, raw_dir, AWS_PROFILE)
 
-        # --- 2. Load into Spark ---
-        sdf = spark.read.parquet(str(raw_dir))
-        print(f"Loaded {sdf.count():,} tracks from raw Parquet")
+        # --- 2. Load into pandas ---
+        raw_table = pq.read_table(str(raw_dir))
+        tracks_pd = raw_table.to_pandas()
+        print(f"Loaded {len(tracks_pd):,} tracks from raw Parquet")
 
-        # --- 3. Convert to pandas for batch Gemini calls ---
-        tracks_pd = sdf.select(
-            "track_id", "title", "artist_name", "genres", "tags"
-        ).toPandas()
-
-        records = tracks_pd.to_dict("records")
+        # --- 3. Batch OpenRouter calls ---
+        records = tracks_pd[["track_id", "title", "artist_name", "genres", "tags"]].to_dict("records")
         batches = [records[i : i + BATCH_SIZE] for i in range(0, len(records), BATCH_SIZE)]
 
         print(f"Enriching {len(records):,} tracks in {len(batches):,} batches of {BATCH_SIZE}...")
@@ -186,44 +168,42 @@ def run() -> None:
 
         all_enrichments: list[dict] = []
         failed_batches = 0
+        i = -1
 
-        for i, batch in enumerate(tqdm(batches, desc="Gemini enrichment")):
-            try:
-                enriched = enrich_batch(client, batch)
-                all_enrichments.extend(enriched)
-            except Exception as e:
-                print(f"  Batch {i} failed: {e}. Filling with empty values.")
-                failed_batches += 1
-                for t in batch:
-                    all_enrichments.append(
-                        {
-                            "track_id": t["track_id"],
-                            "mood_tags": [],
-                            "theme_tags": [],
-                            "energy_level": "",
-                            "danceability_guess": "",
-                            "content_summary": "",
-                        }
-                    )
-            if i < len(batches) - 1:
-                time.sleep(SLEEP_BETWEEN_BATCHES)
+        try:
+            for i, batch in enumerate(tqdm(batches, desc="OpenRouter enrichment")):
+                try:
+                    enriched = enrich_batch(client, batch)
+                    all_enrichments.extend(enriched)
+                except KeyboardInterrupt:
+                    raise
+                except Exception as e:
+                    print(f"  Batch {i} failed: {e}. Filling with empty values.")
+                    failed_batches += 1
+                    for t in batch:
+                        all_enrichments.append(
+                            {
+                                "track_id": t["track_id"],
+                                "mood_tags": [],
+                                "theme_tags": [],
+                                "energy_level": "",
+                                "danceability_guess": "",
+                                "content_summary": "",
+                            }
+                        )
+                if i < len(batches) - 1:
+                    time.sleep(SLEEP_BETWEEN_BATCHES)
+        except KeyboardInterrupt:
+            print(f"\nInterrupted at batch {i}. Saving {len(all_enrichments)} enriched tracks so far.")
 
         print(f"\nEnrichment done. Failed batches: {failed_batches}/{len(batches)}")
 
-        # --- 4. Convert enrichment results to Spark DataFrame ---
+        # --- 4. Join enrichment back to original ---
         enrichment_pd = pd.DataFrame(all_enrichments)
-        enrichment_sdf = spark.createDataFrame(enrichment_pd)
+        enriched_pd = tracks_pd.merge(enrichment_pd, on="track_id", how="left")
+        print(f"Enriched DataFrame: {len(enriched_pd):,} rows")
 
-        # --- 5. Join back to original Spark DataFrame ---
-        enriched_sdf = sdf.join(enrichment_sdf, on="track_id", how="left")
-        print(f"Enriched DataFrame: {enriched_sdf.count():,} rows")
-        enriched_sdf.printSchema()
-
-        # Convert to pandas → pyarrow write (Java 17 breaks PySpark file writer on Windows)
-        enriched_pd = enriched_sdf.toPandas()
-        spark.stop()
-
-        # --- 6. Write enriched Parquet locally, then upload ---
+        # --- 5. Write enriched Parquet locally, then upload ---
         out_dir = Path(tmp) / "enriched"
         out_dir.mkdir()
         table = pa.Table.from_pandas(enriched_pd, preserve_index=False)
