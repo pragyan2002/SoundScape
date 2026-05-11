@@ -216,3 +216,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# SoundScape local data (FMA zip + extracted CSVs)
+data/
