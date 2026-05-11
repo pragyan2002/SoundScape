@@ -28,6 +28,7 @@ RAW_PREFIX = "raw/tracks"
 ENRICHED_PREFIX = "enriched/tracks"
 
 BATCH_SIZE = 30
+MAX_TRACKS = 500
 SLEEP_BETWEEN_BATCHES = 12  # seconds; free-tier Meta/Together ~10 RPM = 6s min, 12s gives headroom
 MAX_RETRIES = 7
 BACKOFF_BASE = 15.0  # seconds; start longer for free-tier rate limits
@@ -160,6 +161,8 @@ def run() -> None:
         print(f"Loaded {len(tracks_pd):,} tracks from raw Parquet")
 
         # --- 3. Batch OpenRouter calls ---
+        tracks_pd = tracks_pd.head(MAX_TRACKS)
+        print(f"Capped to {len(tracks_pd):,} tracks (MAX_TRACKS={MAX_TRACKS})")
         records = tracks_pd[["track_id", "title", "artist_name", "genres", "tags"]].to_dict("records")
         batches = [records[i : i + BATCH_SIZE] for i in range(0, len(records), BATCH_SIZE)]
 

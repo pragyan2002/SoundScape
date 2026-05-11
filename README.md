@@ -1,7 +1,7 @@
 # SoundScape
 
 Music content enrichment pipeline — ingests raw FMA metadata, enriches it with
-Gemini LLM (mood, theme, energy tags), stores structured outputs in S3 Parquet,
+an OpenRouter LLM (mood, theme, energy tags), stores structured outputs in S3 Parquet,
 and evaluates LLM labels against ground-truth Spotify/Echonest audio features.
 
 Built to mirror Spotify's internal music understanding pipelines (Minesweeper squad).
@@ -32,14 +32,15 @@ Built to mirror Spotify's internal music understanding pipelines (Minesweeper sq
   └────────┬────────────────────────┘
            │ read via PySpark
            ▼
-  ┌───────────────────────────────────────┐
-  │  Gemini Enrichment                    │
-  │  enrichment/enrich_tracks.py          │
-  │  - batch 10 tracks → gemini-1.5-flash │
-  │  - JSON mode: mood, theme, energy,    │
-  │    danceability, content_summary      │
-  │  - exponential backoff (15 RPM limit) │
-  └────────┬──────────────────────────────┘
+  ┌─────────────────────────────────────────────────┐
+  │  OpenRouter Enrichment                          │
+  │  enrichment/enrich_tracks.py                    │
+  │  - pandas reads raw Parquet (no Spark needed)   │
+  │  - batch 30 tracks → openai/gpt-oss-120b:free   │
+  │  - JSON mode: mood, theme, energy,              │
+  │    danceability, content_summary                │
+  │  - exponential backoff (free-tier ~10 RPM)      │
+  └────────┬────────────────────────────────────────┘
            │ Parquet (snappy)
            ▼
   ┌──────────────────────────────────────┐
@@ -74,9 +75,40 @@ against these ground-truth features, producing a concrete alignment story.
 |-----------|------|-----|
 | Batch compute | PySpark local[2] | Mirrors EMR job structure |
 | Data lake | AWS S3 (free tier) | Parquet partitioned storage |
-| LLM enrichment | Gemini 1.5 Flash | Free tier, native JSON mode |
+| LLM enrichment | OpenRouter (`gpt-oss-120b:free`) | Free tier, OpenAI-compatible API |
 | Analytics | DuckDB + httpfs | Serverless S3 queries, no Athena cost |
 | Orchestration | Python scripts | Simple, no infra overhead |
+
+## Pipeline Results
+
+Last run enriched **500 tracks** (`MAX_TRACKS` cap) via OpenRouter.
+
+### Alignment (LLM labels vs Echonest ground truth)
+
+| Dimension | Low | Medium | High | Check |
+|-----------|-----|--------|------|-------|
+| Energy (mean Echonest energy) | 0.400 | 0.484 | 0.584 | PASS ✓ |
+| Danceability (mean Echonest danceability) | 0.415 | 0.407 | 0.447 | PASS ✓ |
+
+Energy labels are monotonically ordered against Echonest ground truth. Danceability
+passes the high > low check but medium sits slightly below low — weak signal, not a
+failure.
+
+### Distribution
+
+| Label | Energy % | Danceability % |
+|-------|----------|----------------|
+| low | 36.7 | 46.4 |
+| medium | 33.1 | 30.2 |
+| high | 30.2 | 23.5 |
+
+No distribution collapse (threshold: 70%). Danceability skews low-heavy.
+
+### Coverage note
+
+Evaluation reads the full enriched Parquet (26,758 rows). Only the 500 enriched tracks
+carry LLM labels — the rest are unenriched rows from previous runs still present in S3.
+Quality metrics (`pct_with_mood_tags` etc.) reflect this: ~1.9% = 500 / 26,758.
 
 ## Setup
 
@@ -84,7 +116,7 @@ See [SETUP.md](SETUP.md) for AWS configuration.
 
 ```bash
 cp .env.example .env
-# fill in S3_BUCKET_NAME and GEMINI_API_KEY
+# fill in S3_BUCKET_NAME and OPENROUTER_API_KEY
 
 pip install -r requirements.txt
 
