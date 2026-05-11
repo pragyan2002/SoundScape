@@ -25,7 +25,7 @@ from pyspark.sql import functions as F
 from pyspark.sql.types import DoubleType, LongType, StringType, StructField, StructType
 from tqdm import tqdm
 
-load_dotenv()
+load_dotenv(override=True)
 
 FMA_URL = "https://os.unil.cloud.switch.ch/fma/fma_metadata.zip"
 FMA_SHA1 = "f0df49ffe5f2a6008d7dc83c6915b31835dfe733"
@@ -83,13 +83,13 @@ def load_tracks(data_dir: Path) -> pd.DataFrame:
     path = _find_csv(data_dir, "tracks.csv")
     raw = pd.read_csv(path, index_col=0, header=[0, 1])
     df = pd.DataFrame({
-        "track_id": raw.index.astype(int),
-        "title": raw[("track", "title")].astype(str),
-        "artist_name": raw[("artist", "name")].astype(str),
-        "genres": raw[("track", "genres")].astype(str),
-        "tags": raw[("track", "tags")].astype(str),
-        "listens": pd.to_numeric(raw[("track", "listens")], errors="coerce"),
-        "duration": pd.to_numeric(raw[("track", "duration")], errors="coerce"),
+        "track_id": raw.index.astype(int).values,
+        "title": raw[("track", "title")].astype(str).values,
+        "artist_name": raw[("artist", "name")].astype(str).values,
+        "genres": raw[("track", "genres")].astype(str).values,
+        "tags": raw[("track", "tags")].astype(str).values,
+        "listens": pd.to_numeric(raw[("track", "listens")], errors="coerce").values,
+        "duration": pd.to_numeric(raw[("track", "duration")], errors="coerce").values,
     })
     return df
 
@@ -99,13 +99,13 @@ def load_echonest(data_dir: Path) -> pd.DataFrame:
     raw = pd.read_csv(path, index_col=0, header=[0, 1, 2])
     af = raw["echonest"]["audio_features"]
     df = pd.DataFrame({
-        "track_id": raw.index.astype(int),
-        "tempo": pd.to_numeric(af["tempo"], errors="coerce"),
-        "energy": pd.to_numeric(af["energy"], errors="coerce"),
-        "valence": pd.to_numeric(af["valence"], errors="coerce"),
-        "danceability": pd.to_numeric(af["danceability"], errors="coerce"),
-        "acousticness": pd.to_numeric(af["acousticness"], errors="coerce"),
-        "speechiness": pd.to_numeric(af["speechiness"], errors="coerce"),
+        "track_id": raw.index.astype(int).values,
+        "tempo": pd.to_numeric(af["tempo"], errors="coerce").values,
+        "energy": pd.to_numeric(af["energy"], errors="coerce").values,
+        "valence": pd.to_numeric(af["valence"], errors="coerce").values,
+        "danceability": pd.to_numeric(af["danceability"], errors="coerce").values,
+        "acousticness": pd.to_numeric(af["acousticness"], errors="coerce").values,
+        "speechiness": pd.to_numeric(af["speechiness"], errors="coerce").values,
     })
     return df
 
@@ -209,20 +209,24 @@ def run() -> None:
     print(f"  after Spark dedup/nulls: {sdf.count():,} tracks")
     sdf.printSchema()
 
-    # --- 6. Write Parquet locally, then upload ---
+    # --- 6. Convert back to pandas → write Parquet via pyarrow → upload ---
+    # PySpark's file writer hits a Java 17 security manager issue on Windows.
+    # Spark is still used for all transforms above (mirrors EMR job structure).
+    print("Converting Spark DataFrame to pandas for Parquet write...")
+    final_pd = sdf.toPandas()
+    spark.stop()
+
     with tempfile.TemporaryDirectory() as tmp:
         out_path = Path(tmp) / "tracks"
-        (
-            sdf
-            .coalesce(4)
-            .write
-            .mode("overwrite")
-            .option("compression", "snappy")
-            .parquet(str(out_path))
+        out_path.mkdir()
+        table = pa.Table.from_pandas(final_pd, preserve_index=False)
+        pq.write_to_dataset(
+            table,
+            root_path=str(out_path),
+            compression="snappy",
         )
         upload_parquet_to_s3(out_path, S3_BUCKET, S3_KEY_PREFIX, AWS_PROFILE)
 
-    spark.stop()
     print("Ingestion complete.")
 
 
