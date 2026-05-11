@@ -1,13 +1,13 @@
 """
 Gemini enrichment pipeline.
 
-Reads raw Parquet from S3, calls gemini-1.5-flash in batches of 10
+Reads raw Parquet from S3, calls gemini-1.5-flash in batches of 30
 with native JSON mode, joins enrichment back to the Spark DataFrame,
 and writes enriched Parquet to S3 enriched/tracks/.
 
 Rate limit: Gemini free tier = 15 RPM. Pipeline sleeps 5s between
-batches (10 tracks/call) → ~4 RPM, well within limit.
-At 1,300 batches for 13K tracks, expect ~108 min total runtime.
+batches (30 tracks/call) → ~4 RPM, well within limit.
+At 438 batches for 13K tracks, expect ~37 min total runtime.
 """
 import json
 import os
@@ -35,7 +35,7 @@ GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 RAW_PREFIX = "raw/tracks"
 ENRICHED_PREFIX = "enriched/tracks"
 
-BATCH_SIZE = 10
+BATCH_SIZE = 30
 SLEEP_BETWEEN_BATCHES = 5  # seconds — keeps us ~4 RPM vs 15 RPM limit
 MAX_RETRIES = 5
 
